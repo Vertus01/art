@@ -1,0 +1,76 @@
+pipeline {
+    agent { label 'dind' }
+    environment {
+        DOCKERHUB_CREDENTIALS = credentials('7d24f3bf-7fb0-4c38-814b-1cb3273cf62d')
+    }
+
+    stages {
+        stage("Checkout") {
+            steps {
+                echo 'Checking out ...'
+                git branch: 'main',
+                    url: 'https://github.com/Vertus01/art.git'
+                sh 'ls -la' // Juste pour voir les fichiers
+            }
+        }
+
+        stage("Running tests...") {
+            steps {
+                echo 'Building test container...'
+                sh 'docker build --no-cache -t test-container -f  Dockerfile .'
+                sh 'docker run --rm test-container sh -c " coverage run -m pytest && coverage report" > test.txt'
+                // lancement des tests
+                sh '''
+                    if grep -q "== FAILURES ==" test.txt; then
+                        echo "Erreurs détectées, merci de vérifier les logs :"
+                        cat test.txt
+                        exit 1
+                    else
+                        echo "Aucune erreur détectée"
+                    fi'''
+                sh '''
+                    if [ "$(grep '^TOTAL' test.txt | awk '{print $NF}' | tr -d '%')" -lt 70 ]; then
+                        echo "Le code n'atteint pas les 70%, merci d'améliorer votre code :"
+                        cat test.txt
+                        exit 1
+                    else
+                        echo "Code passable"
+                    fi
+                '''
+            }
+        }
+
+        stage("Building") {
+            steps {
+                echo 'Building PROD container...'
+                sh '''
+                    version=$(wget -q -O - "https://hub.docker.com/v2/repositories/thanseesgi/conteneur-devops/tags?page_size=1" \
+                        | grep -o '"name": *"[^"]*' \
+                        | grep -o '[^"]*$' \
+                        | grep -E '^[0-9]+\\.[0-9]+\\.[0-9]+$' \
+                        | sort -V \
+                        | tail -n1 \
+                        | awk -F. '{OFS="."; $3+=1; print $1,$2,$3}')
+                    echo $DOCKERHUB_CREDENTIALS_PSW | docker login -u $DOCKERHUB_CREDENTIALS_USR --password-stdin
+                    docker tag test-container thanseesgi/conteneur-devops:latest
+                    docker push thanseesgi/conteneur-devops:latest
+                    docker tag test-container thanseesgi/conteneur-devops:$version
+                    docker push thanseesgi/conteneur-devops:$version
+                '''
+            }
+        }
+
+        stage("Deployement on prod server") {
+            steps {
+                echo 'Deploying on prod'
+                sshagent(credentials: ['prod']) {
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no root@10.0.2.6 "docker ps -a -q --filter name=^/museum$ | xargs -r docker rm -f"
+                        ssh -o StrictHostKeyChecking=no root@10.0.2.6 "docker pull thanseesgi/conteneur-devops:latest"
+                        ssh -o StrictHostKeyChecking=no root@10.0.2.6 "docker run -d -p 8000:8000 --name museum thanseesgi/conteneur-devops:latest "
+                    '''
+                }
+            }
+        }
+    }
+}
